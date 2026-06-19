@@ -1199,9 +1199,14 @@ class Gemma4NativeVisionAttention(nn.Module):
         v = v.view(B, S, self.num_kv_heads, self.head_dim)
         v = self.v_norm(v).transpose(1, 2)  # no RoPE for v
 
+        # scale=1.0 (unscaled) makes FA2 BF16 softmax numerically unstable for long
+        # sequences. Cast to float32 so SDPA uses the efficient-attention backend,
+        # which computes softmax in float32 (matching HF eager_attention_forward).
         attn_out = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=attention_mask, scale=1.0
-        )
+            q.float(), k.float(), v.float(),
+            attn_mask=attention_mask.float() if attention_mask is not None else None,
+            scale=1.0,
+        ).to(q.dtype)
         attn_out = attn_out.transpose(1, 2).reshape(B, S, -1)
         out, _ = self.o_proj(attn_out)
         return out
