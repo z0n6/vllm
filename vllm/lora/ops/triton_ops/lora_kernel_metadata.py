@@ -78,7 +78,10 @@ class LoRAKernelMeta:
             max_loras + 2, dtype=torch.int32, device=device
         )
 
-        no_lora_flag_cpu = torch.tensor([False], dtype=torch.bool, device="cpu")
+        # True = skip LoRA (safe default before prepare_tensors() is called).
+        # False would allow the shrink kernel to run with uninitialized
+        # token_indices_sorted_by_lora_ids, causing out-of-bounds reads → NaN.
+        no_lora_flag_cpu = torch.tensor([True], dtype=torch.bool, device="cpu")
 
         num_active_loras_cpu = torch.tensor([0], dtype=torch.int32, device="cpu")
         default_num_active_loras_cpu = torch.tensor(

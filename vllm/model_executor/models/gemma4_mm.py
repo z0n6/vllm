@@ -1199,9 +1199,21 @@ class Gemma4NativeVisionAttention(nn.Module):
         v = v.view(B, S, self.num_kv_heads, self.head_dim)
         v = self.v_norm(v).transpose(1, 2)  # no RoPE for v
 
-        attn_out = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=attention_mask, scale=1.0
-        )
+        # Upcast to float32 before attention, matching HF eager_attention_forward.
+        # F.scaled_dot_product_attention does not guarantee float32 softmax when
+        # inputs are bfloat16 (FlashAttention backend skips the upcast), which
+        # can produce NaN with scale=1.0 and large logit magnitudes.
+        # nan_to_num guards the all-masked edge case (image with zero valid patches).
+        q_f = q.float()
+        k_f = k.float()
+        v_f = v.float()
+        attn_mask_f = attention_mask.float() if attention_mask is not None else None
+        logits = torch.matmul(q_f, k_f.transpose(-2, -1))
+        if attn_mask_f is not None:
+            logits = logits + attn_mask_f
+        weights = F.softmax(logits, dim=-1)
+        weights = torch.nan_to_num(weights, nan=0.0)
+        attn_out = torch.matmul(weights, v_f).to(q.dtype)
         attn_out = attn_out.transpose(1, 2).reshape(B, S, -1)
         out, _ = self.o_proj(attn_out)
         return out
@@ -1245,16 +1257,22 @@ class Gemma4NativeVisionEncoderLayer(nn.Module):
         attention_mask: "torch.Tensor | None",
     ) -> torch.Tensor:
         residual = hidden_states
-        hidden_states = self.self_attn(
+        attn_out = self.self_attn(
             self.input_layernorm(hidden_states),
             position_embeddings,
             attention_mask,
         )
-        hidden_states = residual + self.post_attention_layernorm(hidden_states)
+        # bfloat16 projection weights can produce inf for large activations;
+        # inf fed to RMSNorm gives inf/inf = NaN.  Replace inf with 0 so the
+        # residual pass-through keeps the layer a no-op for those positions.
+        attn_out = torch.nan_to_num(attn_out, nan=0.0, posinf=0.0, neginf=0.0)
+        hidden_states = residual + self.post_attention_layernorm(attn_out)
 
         residual = hidden_states
-        hidden_states = self.mlp(self.pre_feedforward_layernorm(hidden_states))
-        return residual + self.post_feedforward_layernorm(hidden_states)
+        mlp_out = self.mlp(self.pre_feedforward_layernorm(hidden_states))
+        # gate×up in bfloat16 can overflow to inf for large hidden magnitudes.
+        mlp_out = torch.nan_to_num(mlp_out, nan=0.0, posinf=0.0, neginf=0.0)
+        return residual + self.post_feedforward_layernorm(mlp_out)
 
 
 class Gemma4NativeVisionEncoder(nn.Module):
@@ -1285,8 +1303,10 @@ class Gemma4NativeVisionEncoder(nn.Module):
         attention_mask: torch.Tensor,
         pixel_position_ids: torch.Tensor,
     ):
-        # Convert bool (B,S) True=valid mask to additive (B,1,1,S) float mask
+        # Convert bool (B,S) True=valid mask to additive (B,1,1,S) float32 mask
         # so that padding keys receive −∞ logits before softmax.
+        # Built in float32 (not the model dtype) so the attention computation
+        # can safely upcast to float32 regardless of the model dtype.
         additive_mask: torch.Tensor | None = None
         if attention_mask is not None:
             additive_mask = torch.zeros(
@@ -1294,7 +1314,7 @@ class Gemma4NativeVisionEncoder(nn.Module):
                 1,
                 1,
                 attention_mask.shape[1],
-                dtype=inputs_embeds.dtype,
+                dtype=torch.float32,
                 device=inputs_embeds.device,
             )
             additive_mask.masked_fill_(~attention_mask[:, None, None, :], float("-inf"))
@@ -1302,8 +1322,15 @@ class Gemma4NativeVisionEncoder(nn.Module):
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, pixel_position_ids)
 
-        for layer in self.layers:
+        for i, layer in enumerate(self.layers):
             hidden_states = layer(hidden_states, position_embeddings, additive_mask)
+            if torch.isnan(hidden_states).any():
+                logger.warning(
+                    "NaN in ViT encoder hidden_states after layer %d "
+                    "(shape=%s dtype=%s device=%s)",
+                    i, tuple(hidden_states.shape),
+                    hidden_states.dtype, hidden_states.device,
+                )
 
         return SimpleNamespace(last_hidden_state=hidden_states)
 
