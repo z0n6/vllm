@@ -912,13 +912,19 @@ class Gemma4MultiModalProcessor(BaseMultiModalProcessor[Gemma4ProcessingInfo]):
 # Native Gemma4 vision tower (LoRA-compatible, replaces AutoModel.from_config)
 #
 # Key design choices:
-#   - All attention/MLP linears wrapped in disable_tp=True to keep the ViT
-#     data-parallel, preventing vLLM LoRA from sharding LoRA-B matrices.
-#   - Clip linears wrapped under a `.linear` sub-module (Gemma4NativeClipped*)
-#     so that parameter paths exactly match the HF checkpoint naming, e.g.
-#     `vision_tower.encoder.layers.0.self_attn.q_proj.linear.weight`.
-#   - AutoWeightsLoader auto-loads the four clip buffers (input_min/max,
-#     output_min/max) as persistent buffers on each wrapper module.
+#   - Self-attention q/k/v/o are plain vLLM ColumnParallelLinear /
+#     RowParallelLinear with disable_tp=True. disable_tp keeps the ViT
+#     data-parallel (no base-weight sharding) AND lets the LoRA system wrap each
+#     projection natively as a LinearBase, exactly like every other vLLM ViT
+#     (e.g. Siglip / Qwen2.5-VL). Their per-projection activation clip
+#     (HF Gemma4ClippableLinear) lives as ±inf default buffers on the attention
+#     module and is applied around the linear in forward (`_clipped_linear`), so
+#     the clamp wraps the LoRA-augmented output and never sits inside the linear.
+#     `_remap_vision_attn_weights` strips the HF `.linear` nesting and relocates
+#     the attention clip buffers onto the attention module at load time.
+#   - The MLP is NOT a LoRA target, so it keeps the simpler non-LinearBase clip
+#     wrapper (`_Gemma4ClippedColumn/RowLinear`, matmul under `.linear`), whose
+#     parameter paths match the HF checkpoint directly (no remap).
 # ---------------------------------------------------------------------------
 
 
@@ -948,69 +954,40 @@ def _apply_2d_rope(
     return torch.cat(out_parts, dim=-1)
 
 
-class Gemma4NativeClippedColumnLinear(nn.Module):
-    """ColumnParallelLinear (disable_tp=True) nested under ``.linear`` to
-    match HF checkpoint paths (e.g. ``q_proj.linear.weight``).  The four
-    clip buffers replicate ``Gemma4ClippableLinear`` semantics; they are
-    initialised to ±inf (no-op) and overwritten from the checkpoint."""
-
-    def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        quant_config=None,
-        prefix: str = "",
-    ):
-        super().__init__()
-        self.linear = ColumnParallelLinear(
-            in_features,
-            out_features,
-            bias=False,
-            quant_config=quant_config,
-            prefix=maybe_prefix(prefix, "linear"),
-            disable_tp=True,
-        )
-        self.register_buffer("input_min", torch.tensor(float("-inf")))
-        self.register_buffer("input_max", torch.tensor(float("inf")))
-        self.register_buffer("output_min", torch.tensor(float("-inf")))
-        self.register_buffer("output_max", torch.tensor(float("inf")))
-
-    def forward(self, x: torch.Tensor):
-        x = x.clamp(min=self.input_min, max=self.input_max)
-        out, bias = self.linear(x)
-        return out.clamp(min=self.output_min, max=self.output_max), bias
+# ---------------------------------------------------------------------------
+# Gemma4 ViT activation clipping
+#
+# Each ViT projection carries a learned activation clip range
+# (input/output min/max) replicating HF ``Gemma4ClippableLinear``. The
+# projections themselves are plain vLLM ``ColumnParallelLinear`` /
+# ``RowParallelLinear`` (LinearBase) so the LoRA system wraps them natively
+# (as in every other vLLM ViT, e.g. Siglip/Qwen2.5-VL). The clip buffers live
+# on the *parent* module (attention / MLP) and the clamp is applied around the
+# linear in the parent ``forward`` — i.e. clip wraps the LoRA-augmented output,
+# matching HF, and the clamp is never inside the linear (where LoRA's
+# ``quant_method.apply`` path would bypass it).
+# ---------------------------------------------------------------------------
+def _register_clip_buffers(module: nn.Module, proj_names: Sequence[str]) -> None:
+    """Register ±inf (no-op) clip buffers for each projection; the real bounds
+    are loaded from the checkpoint via the ``load_weights`` remap."""
+    for p in proj_names:
+        module.register_buffer(f"{p}_input_min", torch.tensor(float("-inf")))
+        module.register_buffer(f"{p}_input_max", torch.tensor(float("inf")))
+        module.register_buffer(f"{p}_output_min", torch.tensor(float("-inf")))
+        module.register_buffer(f"{p}_output_max", torch.tensor(float("inf")))
 
 
-class Gemma4NativeClippedRowLinear(nn.Module):
-    """RowParallelLinear (disable_tp=True) nested under ``.linear`` with
-    four clip buffers, mirroring ``Gemma4NativeClippedColumnLinear``."""
-
-    def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        quant_config=None,
-        prefix: str = "",
-    ):
-        super().__init__()
-        self.linear = RowParallelLinear(
-            in_features,
-            out_features,
-            bias=False,
-            input_is_parallel=True,
-            quant_config=quant_config,
-            prefix=maybe_prefix(prefix, "linear"),
-            disable_tp=True,
-        )
-        self.register_buffer("input_min", torch.tensor(float("-inf")))
-        self.register_buffer("input_max", torch.tensor(float("inf")))
-        self.register_buffer("output_min", torch.tensor(float("-inf")))
-        self.register_buffer("output_max", torch.tensor(float("inf")))
-
-    def forward(self, x: torch.Tensor):
-        x = x.clamp(min=self.input_min, max=self.input_max)
-        out, bias = self.linear(x)
-        return out.clamp(min=self.output_min, max=self.output_max), bias
+def _clipped_linear(owner: nn.Module, proj_name: str, x: torch.Tensor) -> torch.Tensor:
+    """clip(input) -> ``owner.<proj_name>`` linear -> clip(output)."""
+    x = x.clamp(
+        min=getattr(owner, f"{proj_name}_input_min"),
+        max=getattr(owner, f"{proj_name}_input_max"),
+    )
+    out, _ = getattr(owner, proj_name)(x)
+    return out.clamp(
+        min=getattr(owner, f"{proj_name}_output_min"),
+        max=getattr(owner, f"{proj_name}_output_max"),
+    )
 
 
 class Gemma4NativeVision2DRotaryEmbedding(nn.Module):
@@ -1092,8 +1069,54 @@ class Gemma4NativeVisionPatchEmbedder(nn.Module):
         return x + self._position_embeddings(pixel_position_ids, padding_positions)
 
 
+class _Gemma4ClippedColumnLinear(nn.Module):
+    """ColumnParallelLinear (disable_tp=True) nested under ``.linear`` with four
+    clip buffers, replicating HF ``Gemma4ClippableLinear``. Used for the ViT MLP,
+    which is NOT a LoRA target, so it deliberately stays a non-LinearBase wrapper
+    (parameter paths match the HF checkpoint, no load_weights remap needed). The
+    self-attention path instead uses plain LinearBase projections + ``_clipped_linear``
+    so LoRA wraps them natively."""
+
+    def __init__(self, in_features, out_features, quant_config=None, prefix=""):
+        super().__init__()
+        self.linear = ColumnParallelLinear(
+            in_features, out_features, bias=False, quant_config=quant_config,
+            prefix=maybe_prefix(prefix, "linear"), disable_tp=True,
+        )
+        self.register_buffer("input_min", torch.tensor(float("-inf")))
+        self.register_buffer("input_max", torch.tensor(float("inf")))
+        self.register_buffer("output_min", torch.tensor(float("-inf")))
+        self.register_buffer("output_max", torch.tensor(float("inf")))
+
+    def forward(self, x: torch.Tensor):
+        x = x.clamp(min=self.input_min, max=self.input_max)
+        out, bias = self.linear(x)
+        return out.clamp(min=self.output_min, max=self.output_max), bias
+
+
+class _Gemma4ClippedRowLinear(nn.Module):
+    """RowParallelLinear (disable_tp=True) clip wrapper; see the Column variant."""
+
+    def __init__(self, in_features, out_features, quant_config=None, prefix=""):
+        super().__init__()
+        self.linear = RowParallelLinear(
+            in_features, out_features, bias=False, input_is_parallel=True,
+            quant_config=quant_config, prefix=maybe_prefix(prefix, "linear"),
+            disable_tp=True,
+        )
+        self.register_buffer("input_min", torch.tensor(float("-inf")))
+        self.register_buffer("input_max", torch.tensor(float("inf")))
+        self.register_buffer("output_min", torch.tensor(float("-inf")))
+        self.register_buffer("output_max", torch.tensor(float("inf")))
+
+    def forward(self, x: torch.Tensor):
+        x = x.clamp(min=self.input_min, max=self.input_max)
+        out, bias = self.linear(x)
+        return out.clamp(min=self.output_min, max=self.output_max), bias
+
+
 class Gemma4NativeVisionMLP(nn.Module):
-    """Gated MLP (separate gate/up projections) for the Gemma4 ViT."""
+    """Gated MLP for the Gemma4 ViT. Uses clip-wrapper linears (not a LoRA target)."""
 
     def __init__(
         self,
@@ -1102,23 +1125,17 @@ class Gemma4NativeVisionMLP(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        self.gate_proj = Gemma4NativeClippedColumnLinear(
-            config.hidden_size,
-            config.intermediate_size,
-            quant_config=quant_config,
-            prefix=maybe_prefix(prefix, "gate_proj"),
+        self.gate_proj = _Gemma4ClippedColumnLinear(
+            config.hidden_size, config.intermediate_size,
+            quant_config=quant_config, prefix=maybe_prefix(prefix, "gate_proj"),
         )
-        self.up_proj = Gemma4NativeClippedColumnLinear(
-            config.hidden_size,
-            config.intermediate_size,
-            quant_config=quant_config,
-            prefix=maybe_prefix(prefix, "up_proj"),
+        self.up_proj = _Gemma4ClippedColumnLinear(
+            config.hidden_size, config.intermediate_size,
+            quant_config=quant_config, prefix=maybe_prefix(prefix, "up_proj"),
         )
-        self.down_proj = Gemma4NativeClippedRowLinear(
-            config.intermediate_size,
-            config.hidden_size,
-            quant_config=quant_config,
-            prefix=maybe_prefix(prefix, "down_proj"),
+        self.down_proj = _Gemma4ClippedRowLinear(
+            config.intermediate_size, config.hidden_size,
+            quant_config=quant_config, prefix=maybe_prefix(prefix, "down_proj"),
         )
         self.act_fn = get_act_fn(config.hidden_activation)
 
@@ -1134,8 +1151,16 @@ class Gemma4NativeVisionAttention(nn.Module):
 
     Separate q/k/v projections (NOT fused QKVParallelLinear) are required
     because the per-head norms must be applied after reshaping to head
-    granularity but before RoPE.  All projections use disable_tp=True.
+    granularity but before RoPE, and because each projection carries its own
+    activation clip range.  The projections are plain vLLM ``ColumnParallelLinear``
+    / ``RowParallelLinear`` (LinearBase) so the LoRA system wraps them natively
+    (matching every other vLLM ViT, e.g. Siglip/Qwen2.5-VL).  The per-projection
+    clip is applied here in ``forward`` (NOT inside the linear), keeping the
+    linear a pure matmul that LoRA can wrap, with clip wrapping the LoRA-augmented
+    output exactly as HF ``Gemma4ClippableLinear`` does.
     """
+
+    _PROJS = ("q_proj", "k_proj", "v_proj", "o_proj")
 
     def __init__(
         self,
@@ -1148,30 +1173,44 @@ class Gemma4NativeVisionAttention(nn.Module):
         self.num_kv_heads = config.num_key_value_heads
         self.head_dim = config.head_dim
 
-        self.q_proj = Gemma4NativeClippedColumnLinear(
+        self.q_proj = ColumnParallelLinear(
             config.hidden_size,
             self.num_heads * self.head_dim,
+            bias=False,
             quant_config=quant_config,
             prefix=maybe_prefix(prefix, "q_proj"),
+            disable_tp=True,
         )
-        self.k_proj = Gemma4NativeClippedColumnLinear(
+        self.k_proj = ColumnParallelLinear(
             config.hidden_size,
             self.num_kv_heads * self.head_dim,
+            bias=False,
             quant_config=quant_config,
             prefix=maybe_prefix(prefix, "k_proj"),
+            disable_tp=True,
         )
-        self.v_proj = Gemma4NativeClippedColumnLinear(
+        self.v_proj = ColumnParallelLinear(
             config.hidden_size,
             self.num_kv_heads * self.head_dim,
+            bias=False,
             quant_config=quant_config,
             prefix=maybe_prefix(prefix, "v_proj"),
+            disable_tp=True,
         )
-        self.o_proj = Gemma4NativeClippedRowLinear(
+        self.o_proj = RowParallelLinear(
             self.num_heads * self.head_dim,
             config.hidden_size,
+            bias=False,
+            input_is_parallel=True,
             quant_config=quant_config,
             prefix=maybe_prefix(prefix, "o_proj"),
+            disable_tp=True,
         )
+        # Per-projection clip buffers live on this module (default ±inf = no-op),
+        # loaded from the checkpoint via the load_weights remap that relocates
+        # `q_proj.input_min` → `q_proj_input_min`.
+        _register_clip_buffers(self, self._PROJS)
+
         self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.v_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps, has_weight=False)
@@ -1185,17 +1224,17 @@ class Gemma4NativeVisionAttention(nn.Module):
         B, S, _ = hidden_states.shape
         cos, sin = position_embeddings
 
-        q, _ = self.q_proj(hidden_states)
+        q = _clipped_linear(self, "q_proj", hidden_states)
         q = q.view(B, S, self.num_heads, self.head_dim)
         q = self.q_norm(q)
         q = _apply_2d_rope(q, cos, sin).transpose(1, 2)  # (B,H,S,D)
 
-        k, _ = self.k_proj(hidden_states)
+        k = _clipped_linear(self, "k_proj", hidden_states)
         k = k.view(B, S, self.num_kv_heads, self.head_dim)
         k = self.k_norm(k)
         k = _apply_2d_rope(k, cos, sin).transpose(1, 2)
 
-        v, _ = self.v_proj(hidden_states)
+        v = _clipped_linear(self, "v_proj", hidden_states)
         v = v.view(B, S, self.num_kv_heads, self.head_dim)
         v = self.v_norm(v).transpose(1, 2)  # no RoPE for v
 
@@ -1208,7 +1247,7 @@ class Gemma4NativeVisionAttention(nn.Module):
             scale=1.0,
         ).to(q.dtype)
         attn_out = attn_out.transpose(1, 2).reshape(B, S, -1)
-        out, _ = self.o_proj(attn_out)
+        out = _clipped_linear(self, "o_proj", attn_out)
         return out
 
 
@@ -1302,7 +1341,13 @@ class Gemma4NativeVisionEncoder(nn.Module):
                 dtype=inputs_embeds.dtype,
                 device=inputs_embeds.device,
             )
-            additive_mask.masked_fill_(~attention_mask[:, None, None, :], float("-inf"))
+            # Use finfo.min (not -inf): a fully-masked query row (e.g. an empty
+            # padded batch slot) then softmaxes to a finite uniform distribution
+            # instead of NaN, which would otherwise propagate through the ViT.
+            additive_mask.masked_fill_(
+                ~attention_mask[:, None, None, :],
+                torch.finfo(inputs_embeds.dtype).min,
+            )
 
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, pixel_position_ids)
@@ -2178,7 +2223,35 @@ class Gemma4ForConditionalGeneration(
             self,
             ignore_unexpected_prefixes=ignore_prefixes,
         )
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        return loader.load_weights(
+            self._remap_vision_attn_weights(weights),
+            mapper=self.hf_to_vllm_mapper,
+        )
+
+    @staticmethod
+    def _remap_vision_attn_weights(
+        weights: Iterable[tuple[str, torch.Tensor]],
+    ) -> Iterable[tuple[str, torch.Tensor]]:
+        """Adapt HF vision self-attention keys to the native-LinearBase layout.
+
+        Gemma4 ViT self-attn projections are plain ColumnParallel/RowParallel
+        linears (so LoRA wraps them natively), with per-projection clip buffers
+        on the attention module. The HF checkpoint nests the matmul under
+        ``.linear`` and stores clip on the projection, so for vision_tower
+        self-attn keys only:
+          * ``q_proj.linear.weight``  -> ``q_proj.weight``      (strip nesting)
+          * ``q_proj.input_min`` etc. -> ``q_proj_input_min``   (relocate clip)
+        Scoped to ``.vision_tower.`` + ``.self_attn.`` so the MLP clip-wrappers
+        and the HF audio tower (which keep their own ``.linear`` nesting) are
+        untouched.
+        """
+        _clip = ("input_min", "input_max", "output_min", "output_max")
+        for name, w in weights:
+            if ".vision_tower." in name and ".self_attn." in name:
+                name = name.replace("_proj.linear.", "_proj.")
+                for suf in _clip:
+                    name = name.replace(f"_proj.{suf}", f"_proj_{suf}")
+            yield name, w
 
     # ------------------------------------------------------------------ #
     # Multimodal token count helpers (required by SupportsLoRA / vLLM)
